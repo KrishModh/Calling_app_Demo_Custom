@@ -16,10 +16,6 @@ import {
   endCall as endWebRTCCall,
 } from './services/webrtc';
 
-/**
- * Static user roster – mirrors server's ENV list.
- * id must match the ids returned by /api/auth/login.
- */
 const ALL_USERS = [
   { id: '1', name: 'User One' },
   { id: '2', name: 'User Two' },
@@ -27,25 +23,27 @@ const ALL_USERS = [
 
 // ── Call-state machine ────────────────────────────────────────────────────────
 // 'idle'     → no call activity
-// 'calling'  → we initiated a call, waiting for callee to answer
+// 'calling'  → we initiated, waiting for callee
 // 'incoming' → someone is calling us
-// 'in-call'  → audio connection established
+// 'in-call'  → audio connection live
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
   const [onlineUsers, setOnlineUsers]  = useState([]);
   const [callState,   setCallState]    = useState('idle');
-
-  /**
-   * callInfo shape:
-   *   { peerId: string, peerName: string, direction: 'outgoing' | 'incoming' }
-   */
-  const [callInfo, setCallInfo]  = useState(null);
-  const [isMuted,  setIsMuted]   = useState(false);
+  const [callInfo,    setCallInfo]     = useState(null);
+  const [isMuted,     setIsMuted]      = useState(false);
 
   const remoteAudioRef = useRef(null);
   const socketRef      = useRef(null);
+
+  /**
+   * Processing guards – prevent duplicate handling when React StrictMode
+   * mounts effects twice, or when the signaling server relays an event twice.
+   */
+  const processingOffer    = useRef(false);
+  const processingAccepted = useRef(false);
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -53,8 +51,9 @@ export default function App() {
     ALL_USERS.find((u) => u.id !== currentUser?.id),
   [currentUser]);
 
-  /** Tear down WebRTC + reset UI state */
   const cleanupCall = useCallback(() => {
+    processingOffer.current    = false;
+    processingAccepted.current = false;
     endWebRTCCall();
     if (remoteAudioRef.current) {
       remoteAudioRef.current.srcObject = null;
@@ -64,7 +63,7 @@ export default function App() {
     setIsMuted(false);
   }, []);
 
-  // ── Socket wiring (runs once per login) ─────────────────────────────────────
+  // ── Socket wiring ────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!currentUser) return;
@@ -75,14 +74,22 @@ export default function App() {
     // ── 1. Presence ──────────────────────────────────────────────────────────
     socket.on('online-users', (ids) => setOnlineUsers(ids));
 
-    // ── 2. Incoming call request ─────────────────────────────────────────────
+    // ── 2. Incoming call ─────────────────────────────────────────────────────
     socket.on('incoming-call', ({ callerId, callerName }) => {
-      setCallState('incoming');
-      setCallInfo({ peerId: callerId, peerName: callerName, direction: 'incoming' });
+      // Ignore if already in a call
+      setCallState((prev) => {
+        if (prev !== 'idle') return prev;
+        setCallInfo({ peerId: callerId, peerName: callerName, direction: 'incoming' });
+        return 'incoming';
+      });
     });
 
-    // ── 3a. Our call was accepted → we are the CALLER; create + send offer ───
+    // ── 3a. CALLER: callee accepted → create & send offer ────────────────────
     socket.on('call-accepted', async ({ calleeId }) => {
+      // Guard: only process once even if event fires twice
+      if (processingAccepted.current) return;
+      processingAccepted.current = true;
+
       try {
         await getLocalStream();
         createPeerConnection(
@@ -94,7 +101,9 @@ export default function App() {
           (remoteStream) => {
             if (remoteAudioRef.current) {
               remoteAudioRef.current.srcObject = remoteStream;
-              remoteAudioRef.current.play().catch(() => {});
+              remoteAudioRef.current.play().catch((e) =>
+                console.warn('[App] audio.play():', e.message)
+              );
             }
           },
         );
@@ -103,12 +112,12 @@ export default function App() {
         setCallState('in-call');
       } catch (err) {
         console.error('[App] createOffer error:', err);
-        alert('Could not access microphone. Please check browser permissions.');
+        alert('Microphone access denied or unavailable.');
         cleanupCall();
       }
     });
 
-    // ── 3b. Call was rejected ────────────────────────────────────────────────
+    // ── 3b. Call rejected ────────────────────────────────────────────────────
     socket.on('call-rejected', () => {
       alert('The other user declined the call.');
       cleanupCall();
@@ -119,8 +128,12 @@ export default function App() {
       cleanupCall();
     });
 
-    // ── 4. We are the CALLEE; received offer → create + send answer ──────────
+    // ── 4. CALLEE: received offer → create & send answer ─────────────────────
     socket.on('webrtc-offer', async ({ offer, callerId }) => {
+      // Guard: only process once
+      if (processingOffer.current) return;
+      processingOffer.current = true;
+
       try {
         await getLocalStream();
         createPeerConnection(
@@ -132,7 +145,9 @@ export default function App() {
           (remoteStream) => {
             if (remoteAudioRef.current) {
               remoteAudioRef.current.srcObject = remoteStream;
-              remoteAudioRef.current.play().catch(() => {});
+              remoteAudioRef.current.play().catch((e) =>
+                console.warn('[App] audio.play():', e.message)
+              );
             }
           },
         );
@@ -141,12 +156,12 @@ export default function App() {
         setCallState('in-call');
       } catch (err) {
         console.error('[App] createAnswer error:', err);
-        alert('Could not access microphone. Please check browser permissions.');
+        alert('Microphone access denied or unavailable.');
         cleanupCall();
       }
     });
 
-    // ── 5. We are the CALLER; received callee's answer ───────────────────────
+    // ── 5. CALLER: received answer ───────────────────────────────────────────
     socket.on('webrtc-answer', async ({ answer }) => {
       try {
         await setRemoteAnswer(answer);
@@ -155,12 +170,12 @@ export default function App() {
       }
     });
 
-    // ── 6. ICE candidate from peer ───────────────────────────────────────────
+    // ── 6. ICE candidates (buffered in webrtc.js if remoteDesc not set yet) ──
     socket.on('ice-candidate', async ({ candidate }) => {
       await addIceCandidate(candidate);
     });
 
-    // ── 7. Peer ended the call ───────────────────────────────────────────────
+    // ── 7. Peer ended ────────────────────────────────────────────────────────
     socket.on('call-ended', () => cleanupCall());
 
     return () => {

@@ -1,22 +1,21 @@
 /**
  * signaling.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Handles all Socket.IO events needed to broker a WebRTC voice call between
- * exactly two users.
+ * All Socket.IO signaling for WebRTC voice calls between two users.
  *
- * Message flow:
- *   1. Client emits  "register"        → server maps userId → socketId
- *   2. Caller emits  "call-request"    → server forwards to callee
- *   3. Callee emits  "call-accepted"   → server notifies caller
- *      Callee emits  "call-rejected"   → server notifies caller
- *   4. Caller emits  "webrtc-offer"    → server forwards to callee
- *   5. Callee emits  "webrtc-answer"   → server forwards to caller
- *   6. Both emit     "ice-candidate"   → server forwards to peer
- *   7. Either emits  "call-ended"      → server notifies peer
+ * Fix: activeCalls Set prevents call-accepted being relayed twice,
+ * which was causing the double offer/answer seen in production logs.
  */
 
 /** @type {Map<string, string>}  userId → socketId */
 const onlineUsers = new Map();
+
+/**
+ * Track active call pairs to prevent duplicate accepted signals.
+ * Key: `${callerId}-${calleeId}`
+ * @type {Set<string>}
+ */
+const activeCalls = new Set();
 
 const initSignaling = (io) => {
   io.on('connection', (socket) => {
@@ -43,6 +42,15 @@ const initSignaling = (io) => {
 
     // ── 3a. Call accepted (callee → caller) ────────────────────────────────
     socket.on('call-accepted', ({ callerId, calleeId }) => {
+      const callKey = `${callerId}-${calleeId}`;
+
+      // Dedup: if this pair is already accepted, ignore
+      if (activeCalls.has(callKey)) {
+        console.log(`[call]   accepted DUPLICATE ignored ${calleeId} → ${callerId}`);
+        return;
+      }
+      activeCalls.add(callKey);
+
       const callerSocket = onlineUsers.get(callerId);
       if (callerSocket) {
         io.to(callerSocket).emit('call-accepted', { calleeId });
@@ -52,6 +60,9 @@ const initSignaling = (io) => {
 
     // ── 3b. Call rejected (callee → caller) ────────────────────────────────
     socket.on('call-rejected', ({ callerId, calleeId }) => {
+      // Clean up active call tracking
+      activeCalls.delete(`${callerId}-${calleeId}`);
+
       const callerSocket = onlineUsers.get(callerId);
       if (callerSocket) {
         io.to(callerSocket).emit('call-rejected', { calleeId });
@@ -87,6 +98,12 @@ const initSignaling = (io) => {
 
     // ── 7. Call ended ───────────────────────────────────────────────────────
     socket.on('call-ended', ({ targetId }) => {
+      // Clean up active call tracking for both directions
+      if (socket.userId) {
+        activeCalls.delete(`${socket.userId}-${targetId}`);
+        activeCalls.delete(`${targetId}-${socket.userId}`);
+      }
+
       const targetSocket = onlineUsers.get(targetId);
       if (targetSocket) {
         io.to(targetSocket).emit('call-ended');
@@ -97,6 +114,10 @@ const initSignaling = (io) => {
     // ── Disconnect ─────────────────────────────────────────────────────────
     socket.on('disconnect', () => {
       if (socket.userId) {
+        // Clean up any active calls involving this user
+        for (const key of activeCalls) {
+          if (key.includes(socket.userId)) activeCalls.delete(key);
+        }
         onlineUsers.delete(socket.userId);
         console.log(`[socket] disconnected userId=${socket.userId}`);
         broadcastOnlineUsers(io);
