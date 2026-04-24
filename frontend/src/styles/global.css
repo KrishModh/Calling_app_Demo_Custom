@@ -1,0 +1,63 @@
+/* ── Reset & base ─────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --color-bg:       #0f1117;
+  --color-surface:  #1a1d27;
+  --color-surface2: #222636;
+  --color-border:   #2e3347;
+  --color-primary:  #5b6ef5;
+  --color-primary-h:#7b8fff;
+  --color-success:  #22c55e;
+  --color-danger:   #ef4444;
+  --color-warn:     #f59e0b;
+  --color-text:     #e8eaf0;
+  --color-muted:    #8891a8;
+  --radius-sm:      6px;
+  --radius-md:      12px;
+  --radius-lg:      20px;
+  --radius-full:    9999px;
+  --shadow-card:    0 8px 32px rgba(0,0,0,0.4);
+  --transition:     0.2s ease;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  outline: none;
+  font-family: inherit;
+}
+
+input {
+  font-family: inherit;
+}
+
+a {
+  color: var(--color-primary);
+}
+
+/* ── Utility: visually-hidden spinner ─────────────────────────────────────── */
+.spinner {
+  display: inline-block;
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
