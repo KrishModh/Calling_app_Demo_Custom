@@ -1,14 +1,14 @@
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5000';
 
-let peerConnection     = null;
-let localStream        = null;
+let peerConnection = null;
+let localStream = null;
 let iceCandidateBuffer = [];
-let remoteDescSet      = false;
+let remoteDescSet = false;
 
 // ── Fetch ICE config from server ──────────────────────────────────────────────
 export const fetchIceConfig = async () => {
   try {
-    const res  = await fetch(`${SERVER_URL}/api/ice-servers`);
+    const res = await fetch(`${SERVER_URL}/api/ice-servers`);
     const data = await res.json();
     console.log('[webrtc] ICE servers received:', JSON.stringify(data.iceServers));
     return data;
@@ -33,12 +33,12 @@ export const getLocalStream = async () => {
 export const createPeerConnection = (iceConfig, onIceCandidate, onRemoteStream) => {
   if (peerConnection) { peerConnection.close(); peerConnection = null; }
   iceCandidateBuffer = [];
-  remoteDescSet      = false;
+  remoteDescSet = false;
 
   console.log('[webrtc] Creating PC with', iceConfig.iceServers?.length, 'ICE servers');
 
   peerConnection = new RTCPeerConnection({
-    iceServers:          iceConfig.iceServers,
+    iceServers: iceConfig.iceServers,
     iceCandidatePoolSize: 10,
   });
 
@@ -49,47 +49,41 @@ export const createPeerConnection = (iceConfig, onIceCandidate, onRemoteStream) 
     }
   };
 
+  // ICE state handler — jab connected ho tab audio deliver karo
   peerConnection.oniceconnectionstatechange = () => {
     const state = peerConnection?.iceConnectionState;
     console.log('[webrtc] ICE state:', state);
-    // 'connected' or 'completed' = audio should flow
+
+    if ((state === 'connected' || state === 'completed') && pendingRemoteStream) {
+      console.log('[webrtc] ICE connected — delivering audio now ✅');
+      onRemoteStreamCb?.(pendingRemoteStream);
+      pendingRemoteStream = null;
+    }
   };
+
 
   peerConnection.onconnectionstatechange = () => {
     console.log('[webrtc] Connection state:', peerConnection?.connectionState);
   };
 
-  // ── Remote audio track handler ──────────────────────────────────────────────
+  // Track handler — store karo, deliver mat karo abhi
   peerConnection.ontrack = ({ streams, track }) => {
-    console.log('[webrtc] ontrack — kind:', track.kind, '| muted:', track.muted, '| enabled:', track.enabled);
+    console.log('[webrtc] ontrack — kind:', track.kind, '| muted:', track.muted);
+    const stream = streams?.[0];
+    if (!stream) return;
 
-    if (!streams || !streams[0]) {
-      console.warn('[webrtc] ontrack fired but no stream!');
-      return;
-    }
-
-    const stream = streams[0];
-
-    // Ensure track is enabled
     track.enabled = true;
+    pendingRemoteStream = stream;
+    onRemoteStreamCb = onRemoteStream;
 
-    const deliver = () => {
-      console.log('[webrtc] delivering remote stream, tracks:', stream.getTracks().length);
+    // Agar ICE already connected hai (fast networks pe)
+    const iceState = peerConnection?.iceConnectionState;
+    if (iceState === 'connected' || iceState === 'completed') {
+      console.log('[webrtc] ICE already connected — delivering immediately');
       onRemoteStream(stream);
-    };
-
-    if (!track.muted) {
-      deliver();
-    } else {
-      // Track muted initially — wait for unmute (media flowing)
-      track.addEventListener('unmute', () => {
-        console.log('[webrtc] track unmuted');
-        deliver();
-      }, { once: true });
-
-      // Fallback: deliver after 800ms even if unmute didn't fire
-      setTimeout(deliver, 800);
+      pendingRemoteStream = null;
     }
+    // Warna wait karo oniceconnectionstatechange ke liye
   };
 
   // Add local mic tracks
