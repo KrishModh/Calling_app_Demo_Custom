@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import Login        from './components/Login';
-import Dashboard    from './components/Dashboard';
-import CallScreen   from './components/CallScreen';
+import Login from './components/Login';
+import Dashboard from './components/Dashboard';
+import CallScreen from './components/CallScreen';
 import IncomingCall from './components/IncomingCall';
 
 import { connectSocket, disconnectSocket } from './services/socket';
@@ -21,62 +21,95 @@ const ALL_USERS = [
   { id: '2', name: 'User Two' },
 ];
 
-// ── Call-state machine ────────────────────────────────────────────────────────
-// 'idle'     → no call activity
-// 'calling'  → we initiated, waiting for callee
-// 'incoming' → someone is calling us
-// 'in-call'  → audio connection live
-// ─────────────────────────────────────────────────────────────────────────────
-
 export default function App() {
   const [currentUser, setCurrentUser] = useState(null);
-  const [onlineUsers, setOnlineUsers]  = useState([]);
-  const [callState,   setCallState]    = useState('idle');
-  const [callInfo,    setCallInfo]     = useState(null);
-  const [isMuted,     setIsMuted]      = useState(false);
+  const [onlineUsers, setOnlineUsers] = useState([]);
+  const [callState, setCallState] = useState('idle');
+  const [callInfo, setCallInfo] = useState(null);
+  const [isMuted, setIsMuted] = useState(false);
+  const [audioBlocked, setAudioBlocked] = useState(false);
 
   const remoteAudioRef = useRef(null);
-  const socketRef      = useRef(null);
-
-  /**
-   * Processing guards – prevent duplicate handling when React StrictMode
-   * mounts effects twice, or when the signaling server relays an event twice.
-   */
-  const processingOffer    = useRef(false);
+  const remoteStreamRef = useRef(null); // store stream separately
+  const socketRef = useRef(null);
+  const processingOffer = useRef(false);
   const processingAccepted = useRef(false);
 
-  // ── Helpers ─────────────────────────────────────────────────────────────────
+  // ── Try to play audio — retries if blocked ──────────────────────────────────
+  const tryPlayAudio = useCallback(async (stream) => {
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
 
-  const getOtherUser = useCallback(() =>
-    ALL_USERS.find((u) => u.id !== currentUser?.id),
-  [currentUser]);
+    audio.srcObject = stream;
+    audio.volume = 1.0;
+    audio.muted = false;
 
+    try {
+      await audio.play();
+      setAudioBlocked(false);
+      console.log('[audio] playing ✅');
+    } catch (err) {
+      console.warn('[audio] autoplay blocked, waiting for user tap:', err.message);
+      setAudioBlocked(true); // show "Tap to hear" button
+    }
+  }, []);
+
+  // ── Manual play — called when user taps "Tap to hear" button ───────────────
+  const handleUnblockAudio = useCallback(async () => {
+    const audio = remoteAudioRef.current;
+    if (!audio) return;
+    if (remoteStreamRef.current) {
+      audio.srcObject = remoteStreamRef.current;
+    }
+    try {
+      await audio.play();
+      setAudioBlocked(false);
+    } catch (e) {
+      console.error('[audio] still blocked:', e);
+    }
+  }, []);
+
+  // ── Cleanup ─────────────────────────────────────────────────────────────────
   const cleanupCall = useCallback(() => {
-    processingOffer.current    = false;
+    processingOffer.current = false;
     processingAccepted.current = false;
+    remoteStreamRef.current = null;
     endWebRTCCall();
-    if (remoteAudioRef.current) {
-      remoteAudioRef.current.srcObject = null;
+    const audio = remoteAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.srcObject = null;
     }
     setCallState('idle');
     setCallInfo(null);
     setIsMuted(false);
+    setAudioBlocked(false);
   }, []);
 
-  // ── Socket wiring ────────────────────────────────────────────────────────────
+  // ── onTrack callback (stable ref) ──────────────────────────────────────────
+  const onRemoteStream = useCallback((stream) => {
+    console.log('[app] remote stream received, tracks:', stream.getTracks().length);
+    remoteStreamRef.current = stream;
+    tryPlayAudio(stream);
+  }, [tryPlayAudio]);
 
+  // ── When callState becomes in-call, retry playing (catches timing issues) ──
+  useEffect(() => {
+    if (callState === 'in-call' && remoteStreamRef.current) {
+      tryPlayAudio(remoteStreamRef.current);
+    }
+  }, [callState, tryPlayAudio]);
+
+  // ── Socket wiring ────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!currentUser) return;
 
     const socket = connectSocket(currentUser.id);
     socketRef.current = socket;
 
-    // ── 1. Presence ──────────────────────────────────────────────────────────
     socket.on('online-users', (ids) => setOnlineUsers(ids));
 
-    // ── 2. Incoming call ─────────────────────────────────────────────────────
     socket.on('incoming-call', ({ callerId, callerName }) => {
-      // Ignore if already in a call
       setCallState((prev) => {
         if (prev !== 'idle') return prev;
         setCallInfo({ peerId: callerId, peerName: callerName, direction: 'incoming' });
@@ -84,9 +117,8 @@ export default function App() {
       });
     });
 
-    // ── 3a. CALLER: callee accepted → create & send offer ────────────────────
+    // CALLER: callee accepted → create offer
     socket.on('call-accepted', async ({ calleeId }) => {
-      // Guard: only process once even if event fires twice
       if (processingAccepted.current) return;
       processingAccepted.current = true;
 
@@ -94,18 +126,9 @@ export default function App() {
         await getLocalStream();
         createPeerConnection(
           (candidate) => socket.emit('ice-candidate', {
-            candidate,
-            targetId: calleeId,
-            senderId: currentUser.id,
+            candidate, targetId: calleeId, senderId: currentUser.id,
           }),
-          (remoteStream) => {
-            if (remoteAudioRef.current) {
-              remoteAudioRef.current.srcObject = remoteStream;
-              remoteAudioRef.current.play().catch((e) =>
-                console.warn('[App] audio.play():', e.message)
-              );
-            }
-          },
+          onRemoteStream,
         );
         const offer = await createOffer();
         socket.emit('webrtc-offer', { offer, targetId: calleeId, callerId: currentUser.id });
@@ -117,7 +140,6 @@ export default function App() {
       }
     });
 
-    // ── 3b. Call rejected ────────────────────────────────────────────────────
     socket.on('call-rejected', () => {
       alert('The other user declined the call.');
       cleanupCall();
@@ -128,9 +150,8 @@ export default function App() {
       cleanupCall();
     });
 
-    // ── 4. CALLEE: received offer → create & send answer ─────────────────────
+    // CALLEE: received offer → create answer
     socket.on('webrtc-offer', async ({ offer, callerId }) => {
-      // Guard: only process once
       if (processingOffer.current) return;
       processingOffer.current = true;
 
@@ -138,18 +159,9 @@ export default function App() {
         await getLocalStream();
         createPeerConnection(
           (candidate) => socket.emit('ice-candidate', {
-            candidate,
-            targetId: callerId,
-            senderId: currentUser.id,
+            candidate, targetId: callerId, senderId: currentUser.id,
           }),
-          (remoteStream) => {
-            if (remoteAudioRef.current) {
-              remoteAudioRef.current.srcObject = remoteStream;
-              remoteAudioRef.current.play().catch((e) =>
-                console.warn('[App] audio.play():', e.message)
-              );
-            }
-          },
+          onRemoteStream,
         );
         const answer = await createAnswer(offer);
         socket.emit('webrtc-answer', { answer, targetId: callerId, calleeId: currentUser.id });
@@ -161,7 +173,6 @@ export default function App() {
       }
     });
 
-    // ── 5. CALLER: received answer ───────────────────────────────────────────
     socket.on('webrtc-answer', async ({ answer }) => {
       try {
         await setRemoteAnswer(answer);
@@ -170,12 +181,10 @@ export default function App() {
       }
     });
 
-    // ── 6. ICE candidates (buffered in webrtc.js if remoteDesc not set yet) ──
     socket.on('ice-candidate', async ({ candidate }) => {
       await addIceCandidate(candidate);
     });
 
-    // ── 7. Peer ended ────────────────────────────────────────────────────────
     socket.on('call-ended', () => cleanupCall());
 
     return () => {
@@ -189,12 +198,10 @@ export default function App() {
       socket.off('ice-candidate');
       socket.off('call-ended');
     };
-  }, [currentUser, cleanupCall]);
+  }, [currentUser, cleanupCall, onRemoteStream]);
 
   // ── Event handlers ───────────────────────────────────────────────────────────
-
   const handleLogin = (user) => setCurrentUser(user);
-
   const handleLogout = () => {
     cleanupCall();
     disconnectSocket();
@@ -208,16 +215,13 @@ export default function App() {
     setCallState('calling');
     setCallInfo({ peerId: targetUser.id, peerName: targetUser.name, direction: 'outgoing' });
     socket.emit('call-request', {
-      callerId:   currentUser.id,
-      callerName: currentUser.name,
-      calleeId:   targetUser.id,
+      callerId: currentUser.id, callerName: currentUser.name, calleeId: targetUser.id,
     });
   };
 
   const handleAcceptCall = () => {
     const socket = socketRef.current;
     if (!socket || !callInfo) return;
-    // Notify the caller; the webrtc-offer event will drive the rest
     socket.emit('call-accepted', { callerId: callInfo.peerId, calleeId: currentUser.id });
   };
 
@@ -237,22 +241,25 @@ export default function App() {
   };
 
   const handleToggleMute = () => {
+    setIsMuted(!toggleMute() === false);
     const micEnabled = toggleMute();
     setIsMuted(!micEnabled);
   };
 
   // ── Render ───────────────────────────────────────────────────────────────────
+  if (!currentUser) return <Login onLogin={handleLogin} />;
 
-  if (!currentUser) {
-    return <Login onLogin={handleLogin} />;
-  }
-
-  const otherUser = getOtherUser();
+  const otherUser = ALL_USERS.find((u) => u.id !== currentUser.id);
 
   return (
     <>
-      {/* Hidden audio element – plays the remote peer's audio stream */}
-      <audio ref={remoteAudioRef} autoPlay playsInline />
+      {/* Always in DOM — never unmount this element */}
+      <audio
+        ref={remoteAudioRef}
+        autoPlay
+        playsInline
+        style={{ display: 'none' }}
+      />
 
       {callState === 'incoming' && callInfo && (
         <IncomingCall
@@ -267,8 +274,10 @@ export default function App() {
           callState={callState}
           peerName={callInfo.peerName}
           isMuted={isMuted}
+          audioBlocked={audioBlocked}
           onToggleMute={handleToggleMute}
           onEndCall={handleEndCall}
+          onUnblockAudio={handleUnblockAudio}
         />
       )}
 

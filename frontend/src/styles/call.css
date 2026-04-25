@@ -285,3 +285,21 @@
   background: var(--color-success);
   color: #fff;
 }
+
+/* ── Tap to hear (autoplay blocked on mobile) ────────────────────────────── */
+.tap-to-hear-btn {
+  background: rgba(245, 158, 11, 0.18);
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  color: #fcd34d;
+  border-radius: var(--radius-sm);
+  padding: 10px 20px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  animation: pulse-warn 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-warn {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.6; }
+}
