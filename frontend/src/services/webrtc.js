@@ -1,149 +1,161 @@
-/**
- * webrtc.js
- * ─────────────────────────────────────────────────────────────────────────────
- * Thin wrapper around the browser WebRTC API.
- *
- * Offer/Answer flow:
- *   ┌─────────────────────────────────────────────────────────┐
- *   │  CALLER                        CALLEE                   │
- *   │  ──────                        ──────                   │
- *   │  getLocalStream()              getLocalStream()          │
- *   │  createPeerConnection()        createPeerConnection()    │
- *   │  createOffer()                                          │
- *   │    └─ setLocalDescription                               │
- *   │    └─ send offer via signal ──────────────────────────► │
- *   │                               createAnswer(offer)       │
- *   │                                 └─ setRemoteDescription │
- *   │                                 └─ setLocalDescription  │
- *   │  ◄────────────────── send answer via signal ────────── │
- *   │  setRemoteAnswer(answer)                                │
- *   │                                                         │
- *   │  ◄──────────── ICE candidates exchanged both ways ───► │
- *   └─────────────────────────────────────────────────────────┘
- */
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5000';
 
-/** Free STUN servers – enough for LAN + most NAT scenarios */
-const ICE_CONFIG = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-  ],
+let peerConnection     = null;
+let localStream        = null;
+let iceCandidateBuffer = [];
+let remoteDescSet      = false;
+
+// ── Fetch ICE config from server ──────────────────────────────────────────────
+export const fetchIceConfig = async () => {
+  try {
+    const res  = await fetch(`${SERVER_URL}/api/ice-servers`);
+    const data = await res.json();
+    console.log('[webrtc] ICE servers received:', JSON.stringify(data.iceServers));
+    return data;
+  } catch (err) {
+    console.warn('[webrtc] ICE fetch failed, STUN only:', err.message);
+    return { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  }
 };
 
-/** @type {RTCPeerConnection | null} */
-let peerConnection = null;
-
-/** @type {MediaStream | null} */
-let localStream = null;
-
 // ── Media ─────────────────────────────────────────────────────────────────────
-
-/**
- * Request microphone access.
- * @returns {Promise<MediaStream>}
- */
 export const getLocalStream = async () => {
+  if (localStream && localStream.active) return localStream;
   localStream = await navigator.mediaDevices.getUserMedia({
-    audio: true,
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     video: false,
   });
+  console.log('[webrtc] local mic tracks:', localStream.getAudioTracks().length);
   return localStream;
 };
 
 // ── Peer Connection ───────────────────────────────────────────────────────────
+export const createPeerConnection = (iceConfig, onIceCandidate, onRemoteStream) => {
+  if (peerConnection) { peerConnection.close(); peerConnection = null; }
+  iceCandidateBuffer = [];
+  remoteDescSet      = false;
 
-/**
- * Create an RTCPeerConnection and attach the local audio track.
- *
- * @param {(candidate: RTCIceCandidate) => void} onIceCandidate
- *   Called whenever a local ICE candidate is gathered; forward it via signaling.
- *
- * @param {(stream: MediaStream) => void} onRemoteStream
- *   Called when remote audio arrives; attach to an <audio> element.
- *
- * @returns {RTCPeerConnection}
- */
-export const createPeerConnection = (onIceCandidate, onRemoteStream) => {
-  peerConnection = new RTCPeerConnection(ICE_CONFIG);
+  console.log('[webrtc] Creating PC with', iceConfig.iceServers?.length, 'ICE servers');
 
-  // Forward local ICE candidates to peer via signaling server
+  peerConnection = new RTCPeerConnection({
+    iceServers:          iceConfig.iceServers,
+    iceCandidatePoolSize: 10,
+  });
+
   peerConnection.onicecandidate = ({ candidate }) => {
-    if (candidate) onIceCandidate(candidate);
+    if (candidate) {
+      console.log('[webrtc] local ICE candidate:', candidate.type, candidate.protocol);
+      onIceCandidate(candidate);
+    }
   };
 
-  // Play incoming audio as soon as the remote track arrives
-  peerConnection.ontrack = ({ streams }) => {
-    if (streams?.[0]) onRemoteStream(streams[0]);
+  peerConnection.oniceconnectionstatechange = () => {
+    const state = peerConnection?.iceConnectionState;
+    console.log('[webrtc] ICE state:', state);
+    // 'connected' or 'completed' = audio should flow
   };
 
-  // Add local audio tracks so the peer can hear us
+  peerConnection.onconnectionstatechange = () => {
+    console.log('[webrtc] Connection state:', peerConnection?.connectionState);
+  };
+
+  // ── Remote audio track handler ──────────────────────────────────────────────
+  peerConnection.ontrack = ({ streams, track }) => {
+    console.log('[webrtc] ontrack — kind:', track.kind, '| muted:', track.muted, '| enabled:', track.enabled);
+
+    if (!streams || !streams[0]) {
+      console.warn('[webrtc] ontrack fired but no stream!');
+      return;
+    }
+
+    const stream = streams[0];
+
+    // Ensure track is enabled
+    track.enabled = true;
+
+    const deliver = () => {
+      console.log('[webrtc] delivering remote stream, tracks:', stream.getTracks().length);
+      onRemoteStream(stream);
+    };
+
+    if (!track.muted) {
+      deliver();
+    } else {
+      // Track muted initially — wait for unmute (media flowing)
+      track.addEventListener('unmute', () => {
+        console.log('[webrtc] track unmuted');
+        deliver();
+      }, { once: true });
+
+      // Fallback: deliver after 800ms even if unmute didn't fire
+      setTimeout(deliver, 800);
+    }
+  };
+
+  // Add local mic tracks
   if (localStream) {
     localStream.getTracks().forEach((track) => {
+      console.log('[webrtc] adding local track:', track.kind, track.label);
       peerConnection.addTrack(track, localStream);
     });
+  } else {
+    console.warn('[webrtc] createPeerConnection called but localStream is null!');
   }
 
   return peerConnection;
 };
 
-// ── Offer / Answer ────────────────────────────────────────────────────────────
-
-/**
- * (Caller) Create an SDP offer and set it as the local description.
- * @returns {Promise<RTCSessionDescriptionInit>}
- */
+// ── Offer ─────────────────────────────────────────────────────────────────────
 export const createOffer = async () => {
-  if (!peerConnection) throw new Error('createPeerConnection() must be called first.');
+  if (!peerConnection) throw new Error('No peer connection');
   const offer = await peerConnection.createOffer();
   await peerConnection.setLocalDescription(offer);
   return offer;
 };
 
-/**
- * (Callee) Set the remote offer and create a matching SDP answer.
- * @param {RTCSessionDescriptionInit} offer
- * @returns {Promise<RTCSessionDescriptionInit>}
- */
+// ── Answer ────────────────────────────────────────────────────────────────────
 export const createAnswer = async (offer) => {
-  if (!peerConnection) throw new Error('createPeerConnection() must be called first.');
+  if (!peerConnection) throw new Error('No peer connection');
   await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+  remoteDescSet = true;
+  await _flushBuffer();
   const answer = await peerConnection.createAnswer();
   await peerConnection.setLocalDescription(answer);
   return answer;
 };
 
-/**
- * (Caller) Apply the callee's SDP answer.
- * @param {RTCSessionDescriptionInit} answer
- */
 export const setRemoteAnswer = async (answer) => {
-  if (!peerConnection) throw new Error('No active peer connection.');
+  if (!peerConnection) throw new Error('No peer connection');
   await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+  remoteDescSet = true;
+  await _flushBuffer();
 };
 
-// ── ICE ───────────────────────────────────────────────────────────────────────
-
-/**
- * Add a remote ICE candidate forwarded by the signaling server.
- * @param {RTCIceCandidateInit} candidate
- */
+// ── ICE buffering ─────────────────────────────────────────────────────────────
 export const addIceCandidate = async (candidate) => {
   if (!peerConnection) return;
+  if (!remoteDescSet) {
+    iceCandidateBuffer.push(candidate);
+    return;
+  }
+  await _apply(candidate);
+};
+
+const _flushBuffer = async () => {
+  const buf = [...iceCandidateBuffer];
+  iceCandidateBuffer = [];
+  for (const c of buf) await _apply(c);
+};
+
+const _apply = async (candidate) => {
   try {
     await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
-  } catch (err) {
-    // Can safely ignore "Cannot add ICE candidate" on closed connections
-    console.warn('[webrtc] addIceCandidate error (ignorable):', err.message);
+  } catch (e) {
+    console.warn('[webrtc] addIceCandidate (ignorable):', e.message);
   }
 };
 
 // ── Controls ──────────────────────────────────────────────────────────────────
-
-/**
- * Toggle microphone mute state.
- * @returns {boolean} `true` if the mic is now ENABLED (unmuted)
- */
 export const toggleMute = () => {
   if (!localStream) return true;
   const [track] = localStream.getAudioTracks();
@@ -152,11 +164,9 @@ export const toggleMute = () => {
   return track.enabled;
 };
 
-/**
- * Stop local media and close the peer connection.
- * Call this when a call ends for any reason.
- */
 export const endCall = () => {
+  iceCandidateBuffer = [];
+  remoteDescSet = false;
   if (localStream) {
     localStream.getTracks().forEach((t) => t.stop());
     localStream = null;
